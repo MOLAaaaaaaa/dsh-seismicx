@@ -1,0 +1,17 @@
+# The dsh-seismicx bundle layer.
+#
+# Applied after @deepseek-ai/dsh-base, so `tools`, `subprocess`, and `jobs` are
+# already provided by the time this row activates. Loader waits for the injected
+# services, so row order here carries no load semantics.
+#
+# `skillRoot` has no default and no sensible one exists: it is the absolute path
+# to the user's seismicx-catalog-skill checkout. Set it in the profile's own
+# cordis.patch.yml, or export SEISMICX_SKILL_ROOT and keep the expression below.
+
+- insert:
+    - id: seismicx
+      name: dsh-seismicx
+      config:
+        skillRoot: !!js process.env.SEISMICX_SKILL_ROOT
+        python: !!js process.env.SEISMICX_PYTHON ?? 'python3'
+        workdir: '.'

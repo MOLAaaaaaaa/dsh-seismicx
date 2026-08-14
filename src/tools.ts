@@ -1,0 +1,306 @@
+/**
+ * Model-facing tools over the seismicx-catalog-skill CLI.
+ *
+ * Each tool owns its schema, validation, and presentation; the Python CLI owns
+ * the science. Two contracts matter here and are the reason these are tools
+ * rather than bash strings:
+ *
+ * - **Arguments are validated before the process starts.** A malformed
+ *   `--real-R` tuple fails at the call boundary instead of after a long run.
+ * - **The canonical value is JSON, not prose.** Callers read `picks_path` from a
+ *   typed field; nothing parses stdout to recover a path.
+ *
+ * @module
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { GenericCallView, ToolCallKind } from '@deepseek-ai/dsh-tools'
+import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
+import { lastLine, runSeismicx, tailLines, type CliRun, type SkillPaths } from './cli.ts'
+
+/**
+ * `JobKind` is a merge-extensible union, so this package declares the producer
+ * kind it starts. The kind doubles as the job-id prefix (`seismicx-pick-1`).
+ */
+declare module '@deepseek-ai/dsh-jobs' {
+  interface JobKindMap {
+    'seismicx-pick': 'seismicx-pick'
+  }
+}
+
+/** Trailing stderr lines carried into a failed result. */
+const ERROR_TAIL_LINES = 20
+
+/** Exit code reported when the process died from a signal rather than exiting. */
+const SIGNAL_EXIT_CODE = -1
+
+/** Shared shape of every CLI-backed canonical value. */
+interface RunFacts {
+  readonly exit_code: number
+  readonly signal: string
+  readonly stderr_tail: string
+}
+
+/**
+ * Project one completed run into the fields every tool result carries.
+ * @param run - the completed CLI run.
+ * @returns exit facts plus a bounded stderr tail.
+ */
+function runFacts(run: CliRun): RunFacts {
+  return {
+    exit_code: run.exitCode ?? SIGNAL_EXIT_CODE,
+    signal: run.signal ?? '',
+    stderr_tail: tailLines(run.stderr, ERROR_TAIL_LINES),
+  }
+}
+
+/** Schema fragment shared by every CLI-backed output. */
+const RUN_FACT_PROPERTIES = {
+  exit_code: { type: 'integer', required: true, description: 'CLI exit code; -1 when the process died from a signal.' },
+  signal: { type: 'string', required: true, description: 'Terminating signal name, or empty on normal exit.' },
+  stderr_tail: { type: 'string', required: true, description: 'Trailing stderr lines; empty on a clean run.' },
+} as const
+
+/** Generic card for a call whose subject is one output path. */
+function pathCall(kind: ToolCallKind, title: string): GenericCallView {
+  return { card: 'generic', title, kind, rawInput: title }
+}
+
+/**
+ * Register `seismicx_list_models`: the bundled picker/polarity checkpoints.
+ *
+ * Cheap, read-only, and concurrency-safe, so it is the tool to call first when
+ * verifying that `skillRoot` and `python` are configured correctly.
+ */
+export function applyListModelsTool(ctx: Context, paths: SkillPaths, timeoutMs: number): void {
+  ctx.tools.register(defineTool({
+    name: 'seismicx_list_models',
+    description: 'List the phase-picking and first-motion checkpoints bundled with the SeismicX catalog skill.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          listing: { type: 'string', required: true, description: 'The CLI listing as printed.' },
+          ...RUN_FACT_PROPERTIES,
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.exit_code === 0 ? value.listing : `list-models failed (exit ${value.exit_code})\n${value.stderr_tail}` }],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(_args, exec) {
+      const run = await runSeismicx(ctx, paths, 'list-models', [], exec.signal)
+      return { listing: run.stdout.trimEnd(), ...runFacts(run) }
+    },
+    presentCall: () => pathCall('read', 'seismicx: bundled models'),
+  }))
+}
+
+/**
+ * Register `seismicx_scan`: enumerate ObsPy-readable waveform files.
+ *
+ * The first step of the pipeline and the one that establishes whether the
+ * archive is readable at all, so it stays foreground.
+ */
+export function applyScanTool(ctx: Context, paths: SkillPaths, timeoutMs: number): void {
+  ctx.tools.register(defineTool({
+    name: 'seismicx_scan',
+    description: 'Scan a waveform directory for ObsPy-readable files and write the inventory CSV. Run this before picking to confirm the archive is readable.',
+    parameters: {
+      waveform_dir: { type: 'string', required: true, description: 'Directory containing MSEED/SAC/SEED or other ObsPy-readable waveforms.' },
+      output_path: { type: 'string', required: true, description: 'CSV path for the waveform inventory.' },
+      errors_path: { type: 'string', description: 'Optional CSV path collecting unreadable files.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          output_path: { type: 'string', required: true, description: 'The inventory CSV that was written.' },
+          errors_path: { type: 'string', required: true, description: 'The error CSV, or empty when none was requested.' },
+          stdout_tail: { type: 'string', required: true, description: 'Trailing stdout lines from the scan.' },
+          ...RUN_FACT_PROPERTIES,
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.exit_code === 0
+          ? `Waveform inventory written to ${value.output_path}\n${value.stdout_tail}`
+          : `scan failed (exit ${value.exit_code})\n${value.stderr_tail}`,
+      }],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const argv = ['-w', args.waveform_dir, '-o', args.output_path]
+      if (args.errors_path) argv.push('--errors', args.errors_path)
+      const run = await runSeismicx(ctx, paths, 'scan', argv, exec.signal)
+      return {
+        output_path: args.output_path,
+        errors_path: args.errors_path ?? '',
+        stdout_tail: tailLines(run.stdout, 10),
+        ...runFacts(run),
+      }
+    },
+    presentCall: args => pathCall('execute', `seismicx scan: ${args.waveform_dir}`),
+  }))
+}
+
+/**
+ * Register `seismicx_pick`: phase detection over a waveform archive.
+ *
+ * This is the step that runs for hours on continuous data, so it is the one that
+ * justifies the background-job path: `run_in_background: true` publishes a job id
+ * and returns immediately, leaving `job_status`/`job_kill` to collect it. A
+ * foreground call remains available for small archives and smoke tests.
+ *
+ * The skill's standing rule — never band-pass continuous waveforms before the
+ * PNSN picker — is carried in the description rather than as a filter argument,
+ * because the tool deliberately exposes no filtering knob.
+ */
+export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number, allowBackground: boolean): void {
+  ctx.tools.register(defineTool({
+    name: 'seismicx_pick',
+    description: 'Detect and pick seismic phases over a waveform archive with the bundled PNSN picker. Continuous waveforms are picked unfiltered by design; do not pre-filter the archive. Long runs should set run_in_background.',
+    parameters: {
+      waveform_dir: { type: 'string', required: true, description: 'Directory of waveforms to pick.' },
+      output_path: { type: 'string', required: true, description: 'CSV path for the picks.' },
+      phases: { type: 'string', description: 'Comma-separated phases, e.g. "Pg,Sg,Pn,Sn". Defaults to the model\'s full set.' },
+      model: { type: 'string', description: 'Bundled model id from seismicx_list_models. Defaults to pnsn-v3.' },
+      run_in_background: { type: 'boolean', description: 'Publish a background job and return its id instead of waiting.' },
+    },
+    output: {
+      schema: {
+        required: true,
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', required: true, const: 'completed' },
+              picks_path: { type: 'string', required: true },
+              stdout_tail: { type: 'string', required: true },
+              ...RUN_FACT_PROPERTIES,
+            },
+          },
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', required: true, const: 'background' },
+              job_id: { type: 'string', required: true },
+              picks_path: { type: 'string', required: true },
+            },
+          },
+        ],
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.kind === 'background'
+          ? `Picking started as background job ${value.job_id}; picks will land at ${value.picks_path}.`
+          : value.exit_code === 0
+            ? `Picks written to ${value.picks_path}\n${value.stdout_tail}`
+            : `pick failed (exit ${value.exit_code})\n${value.stderr_tail}`,
+      }],
+    },
+    timeoutMs,
+    async execute(args, exec) {
+      const argv = ['-w', args.waveform_dir, '-o', args.output_path, '--picker', 'torchscript-pnsn']
+      if (args.model) argv.push('--model', args.model)
+      if (args.phases) argv.push('--phases', args.phases)
+
+      if (args.run_in_background) {
+        if (!allowBackground) throw new Error('seismicx_pick: background execution is disabled by this deployment\'s plugin config')
+        // An unowned job stays open to any caller until service disposal and
+        // misses owner-disposal cleanup, so a call with no agent behind it
+        // (a direct service invocation rather than a model turn) is refused
+        // rather than silently leaking a multi-hour run.
+        const owner = exec.agent
+        if (!owner) throw new Error('seismicx_pick: run_in_background requires a calling agent to own the job')
+        const controller = new AbortController()
+        const jobId = ctx.jobs.start({
+          kind: 'seismicx-pick',
+          label: `seismicx pick ${args.waveform_dir}`,
+          owner,
+          run: () => {
+            // Published work outlives this call, so it uses its own signal
+            // rather than exec.signal: a later cancellation of the tool call
+            // must not kill a job the runtime has already handed out an id for.
+            const running = runSeismicx(ctx, paths, 'pick', argv, controller.signal)
+            return {
+              cancel: () => controller.abort(),
+              done: running.then(
+                (run): JobOutcome => run.exitCode === 0
+                  ? { status: 'completed', output: `Picks written to ${args.output_path}` }
+                  : {
+                      status: run.signal ? 'killed' : 'failed',
+                      detail: `exit code: ${run.exitCode ?? SIGNAL_EXIT_CODE}`,
+                      output: tailLines(run.stderr, ERROR_TAIL_LINES),
+                    },
+                (error: unknown): JobOutcome => ({ status: 'failed', detail: String(error) }),
+              ),
+            }
+          },
+        })
+        return { kind: 'background' as const, job_id: jobId, picks_path: args.output_path }
+      }
+
+      const run = await runSeismicx(ctx, paths, 'pick', argv, exec.signal)
+      return { kind: 'completed' as const, picks_path: args.output_path, stdout_tail: tailLines(run.stdout, 10), ...runFacts(run) }
+    },
+    presentCall: args => pathCall('execute', `seismicx pick: ${args.waveform_dir}`),
+  }))
+}
+
+/**
+ * Register `seismicx_plot_map`: the event/station map.
+ *
+ * The CLI prints the written path as its last stdout line, which is what the
+ * canonical `map_path` reports. This is the tool a browser half attaches to
+ * first: a `tool.call.toolview` entry keyed `seismicx_plot_map` can render the
+ * image inline instead of leaving a path for the user to open.
+ */
+export function applyPlotMapTool(ctx: Context, paths: SkillPaths, timeoutMs: number): void {
+  ctx.tools.register(defineTool({
+    name: 'seismicx_plot_map',
+    description: 'Plot located events and stations on a map and write a PNG.',
+    parameters: {
+      events_path: { type: 'string', required: true, description: 'Catalog or located-events CSV.' },
+      output_path: { type: 'string', required: true, description: 'PNG path to write.' },
+      stations_path: { type: 'string', description: 'Optional station CSV to overlay.' },
+      title: { type: 'string', description: 'Optional map title.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          map_path: { type: 'string', required: true, description: 'The PNG the CLI reported writing.' },
+          ...RUN_FACT_PROPERTIES,
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.exit_code === 0 ? `Map written to ${value.map_path}` : `plot-map failed (exit ${value.exit_code})\n${value.stderr_tail}`,
+      }],
+      // Carried so a browser half can re-render the card from the log on replay
+      // without re-reading the canonical value.
+      presentationMeta: (_args, value) => ({ mapPath: value.map_path }),
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const argv = ['-e', args.events_path, '-o', args.output_path]
+      if (args.stations_path) argv.push('-s', args.stations_path)
+      if (args.title) argv.push('--title', args.title)
+      const run = await runSeismicx(ctx, paths, 'plot-map', argv, exec.signal)
+      // The CLI prints the path it wrote; fall back to the requested path when
+      // the run failed and printed nothing.
+      return { map_path: lastLine(run.stdout) || args.output_path, ...runFacts(run) }
+    },
+    presentCall: args => pathCall('execute', `seismicx map: ${args.events_path}`),
+  }))
+}
