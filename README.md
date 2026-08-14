@@ -18,11 +18,44 @@ three things a skill cannot do:
 
 Requires a working `seismicx-catalog-skill` checkout and its Python environment.
 
+### From a local checkout (simplest)
+
+`lib/` is not committed, so build once, then install the directory:
+
 ```bash
-dsh plugin --profile <name> add dsh-seismicx
+git clone https://github.com/MOLAaaaaaaa/dsh-seismicx && cd dsh-seismicx && npm install && npm run build
 ```
 
-Then point the plugin at the skill in the profile's `cordis.patch.yml`:
+```bash
+dsh plugin --profile <name> add /absolute/path/to/dsh-seismicx
+```
+
+pnpm links the checkout, so it uses the `lib/` you just built and needs no build permission.
+
+### From GitHub
+
+A git install fetches sources, not build output, so pnpm has to run this package's `prepare`
+script — and pnpm ≥10 refuses to do that until you allow it by name. The first `add` fails and
+prints the key; put it in the profile's `pnpm-workspace.yaml`:
+
+```yaml
+allowBuilds:
+  dsh-seismicx: true
+```
+
+then re-run, pinning a commit so a later push cannot silently change what executes:
+
+```bash
+dsh plugin --profile <name> add github:MOLAaaaaaaa/dsh-seismicx#<sha>
+```
+
+That allowance is permission to execute this package's code on your machine at install time,
+outside any sandbox the agent runs under. `prepare` here is transpile-only (`tsc --noCheck`), so it
+cannot fail from peer-version drift the way a type-checking build would.
+
+### Configure
+
+Point the plugin at the skill in the profile's `cordis.patch.yml`:
 
 ```yaml
 - id: seismicx
@@ -88,6 +121,12 @@ metacharacters cannot escape into a command line.
 **A non-zero exit is a domain outcome, not a throw.** It is represented in the canonical value
 (`exit_code`, `stderr_tail`) so callers can branch on it. Only spawn-level failures reject.
 
+**The Python process is not confined.** Confinement is a consumer responsibility in this
+architecture — `ctx.shell`'s sandbox providers wrap argv before handing it to `ctx.subprocess`, and
+this plugin does not do that wrapping. Treat these tools as carrying the same trust level as the
+bash tool: they run the interpreter you configured, with your ambient filesystem and network
+access. Routing argv through a `ctx.sandbox` backend is listed below as deferred work.
+
 ## Not done yet
 
 - **The remaining nine subcommands.** `polarity`, `associate`, `locate`, `magnitude-ml`,
@@ -101,6 +140,10 @@ metacharacters cannot escape into a command line.
   what a `tool.call.toolview` entry keyed `seismicx_plot_map` needs to render the map inline in the
   conversation instead of leaving a path to open. A GMT/PyGMT renderer and a `shell.overlay`
   control panel (region, projection, depth slice, beachballs) are the intended next step.
+- **No sandbox wrapping.** `ctx.subprocess` is called directly, so the interpreter runs unconfined
+  (see the design note above). Wrapping argv through a `ctx.sandbox` backend would confine it, at
+  the cost of having to widen the policy for the GPU, model cache, and `build-tools` network access
+  the pipeline legitimately needs.
 - **No capability seams.** The picker, associator, locator, and mechanism engines are still CLI
   flags rather than swappable `ctx.*` providers. Seam-ifying them is what would let a freshly
   fine-tuned checkpoint become a plugin row instead of a code change.
