@@ -19,6 +19,18 @@ const STREAM_MAX_BYTES = 1_000_000
 /** SIGTERM → SIGKILL escalation grace period for a cancelled run. */
 const GRACE_MS = 5_000
 
+/**
+ * Environment forced onto every run.
+ *
+ * Python defaults `sys.stdout.encoding` to the host's ANSI code page — GBK on a
+ * Chinese Windows install — while reading paths from the filesystem as UTF-8.
+ * Node then decodes the captured bytes as UTF-8, so any non-ASCII path the CLI
+ * prints comes back mangled. That corrupts data, not just display: `plot-map`
+ * reports the PNG it wrote on stdout, and a mangled path is unusable. Forcing
+ * UTF-8 stdio makes the encoding match on both sides regardless of host locale.
+ */
+const FORCED_ENV = { PYTHONIOENCODING: 'utf-8' } as const
+
 /** Resolved locations the tools need to invoke the skill. */
 export interface SkillPaths {
   /** Absolute path to the seismicx-catalog-skill checkout. */
@@ -82,6 +94,7 @@ export async function runSeismicx(
     },
     graceMs: GRACE_MS,
     signal,
+    env: FORCED_ENV,
   })
   const outcome = await handle.done
   return {

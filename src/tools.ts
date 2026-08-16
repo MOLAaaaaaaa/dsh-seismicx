@@ -173,8 +173,11 @@ export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number
       run_in_background: { type: 'boolean', description: 'Publish a background job and return its id instead of waiting.' },
     },
     output: {
+      // `required` marks a PROPERTY as mandatory within its parent object; it
+      // has no meaning at a schema's own root (the execute() return always
+      // conforms to whichever oneOf branch it picked), so the root carries no
+      // `required` key.
       schema: {
-        required: true,
         oneOf: [
           {
             type: 'object',
