@@ -31,6 +31,43 @@ const GRACE_MS = 5_000
  */
 const FORCED_ENV = { PYTHONIOENCODING: 'utf-8' } as const
 
+/**
+ * Exit codes that mean the operating system killed the process, not that the
+ * CLI decided to fail.
+ *
+ * These matter because they are unreachable from Python: the loader or the CRT
+ * tears the process down before any handler runs, so the CLI exits with no
+ * traceback and, in the delay-load case, no output on either stream. Reporting
+ * the bare number leaves a caller with nothing to act on, which is exactly the
+ * dead end `seismicx_doctor` exists to break.
+ */
+const NATIVE_FATAL_EXITS: ReadonlyMap<number, string> = new Map([
+  [3221225477, '0xC0000005 access violation'],
+  [3221225725, '0xC00000FD stack overflow'],
+  [3221225781, '0xC0000135 a dependent DLL was not found'],
+  [3221226505, '0xC0000409 stack buffer overrun'],
+  [3228369023, '0xC06D007F a delay-loaded DLL was not found'],
+])
+
+/**
+ * Explain a failed run in terms a caller can act on.
+ *
+ * @param exitCode - the process exit code.
+ * @param stderrTail - trailing stderr; empty when the process printed nothing.
+ * @returns a sentence to append to the failure text, or an empty string when
+ *   the exit code is an ordinary CLI failure that speaks for itself.
+ */
+export function explainFailure(exitCode: number, stderrTail: string): string {
+  const native = NATIVE_FATAL_EXITS.get(exitCode)
+  if (native !== undefined) {
+    return `The process was killed by the OS (${native}), so this is an environment fault rather than a data error. Run seismicx_doctor to identify which dependency is broken.`
+  }
+  if (exitCode !== 0 && stderrTail.trim() === '') {
+    return 'The process exited non-zero without printing anything, which is the signature of a native library failing to load rather than a Python error. Run seismicx_doctor to identify which dependency is broken.'
+  }
+  return ''
+}
+
 /** Resolved locations the tools need to invoke the skill. */
 export interface SkillPaths {
   /** Absolute path to the seismicx-catalog-skill checkout. */
@@ -39,6 +76,17 @@ export interface SkillPaths {
   readonly python: string
   /** Working directory the CLI resolves relative output paths against. */
   readonly workdir: string
+  /**
+   * Extra environment variables for every run, from deployment config.
+   *
+   * The plugin deliberately computes nothing here. Which BLAS a host uses,
+   * whether its Python is conda or a venv, and how its OpenMP runtimes are
+   * arranged are facts only the operator knows, and a plugin that guessed would
+   * be wrong for every layout it did not anticipate. This is the seam for
+   * saying so explicitly; `seismicx_doctor` is how the operator finds out what
+   * to put here.
+   */
+  readonly env?: Readonly<Record<string, string>>
 }
 
 /** One completed foreground CLI run. */
@@ -94,7 +142,9 @@ export async function runSeismicx(
     },
     graceMs: GRACE_MS,
     signal,
-    env: FORCED_ENV,
+    // Configured entries come first so FORCED_ENV keeps the last word: UTF-8
+    // stdio is a correctness requirement of this bridge, not a preference.
+    env: { ...paths.env, ...FORCED_ENV },
   })
   const outcome = await handle.done
   return {

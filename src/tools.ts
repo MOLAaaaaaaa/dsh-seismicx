@@ -17,7 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, ToolCallKind } from '@deepseek-ai/dsh-tools'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
-import { lastLine, runSeismicx, tailLines, type CliRun, type SkillPaths } from './cli.ts'
+import { explainFailure, lastLine, runSeismicx, tailLines, type CliRun, type SkillPaths } from './cli.ts'
 
 /**
  * `JobKind` is a merge-extensible union, so this package declares the producer
@@ -68,6 +68,69 @@ function pathCall(kind: ToolCallKind, title: string): GenericCallView {
 }
 
 /**
+ * Render a failed run: what the CLI said, plus what the exit code means when it
+ * means something the stderr tail cannot say for itself.
+ *
+ * @param label - the subcommand name, for the leading line.
+ * @param value - the canonical value's run facts.
+ * @returns the text shown for a non-zero exit.
+ */
+function failureText(label: string, value: RunFacts): string {
+  const explanation = explainFailure(value.exit_code, value.stderr_tail)
+  const parts = [`${label} failed (exit ${value.exit_code})`]
+  if (value.stderr_tail.trim() !== '') parts.push(value.stderr_tail)
+  if (explanation !== '') parts.push(explanation)
+  return parts.join('\n')
+}
+
+/**
+ * Register `seismicx_doctor`: verify this deployment can run the skill at all.
+ *
+ * Separate from `seismicx_list_models` because the two answer different
+ * questions. `list_models` proves the plugin can reach the checkout; `doctor`
+ * proves the interpreter can execute the numerical work, which is a much
+ * stronger claim and the one that fails in the field. The dependencies here
+ * fail natively — a BLAS library that resolves only when the first matrix
+ * multiply runs, two OpenMP runtimes that abort when both load — so the CLI
+ * exercises each one for real in its own process instead of importing it.
+ *
+ * This is the tool to call when any other seismicx tool dies with an exit code
+ * and no output.
+ */
+export function applyDoctorTool(ctx: Context, paths: SkillPaths, timeoutMs: number): void {
+  ctx.tools.register(defineTool({
+    name: 'seismicx_doctor',
+    description:
+      'Check that the configured Python interpreter can actually run the SeismicX workloads: numpy BLAS and LAPACK, obspy, torch, torch and numpy together in one process, TorchScript model loading, and headless matplotlib rendering. Each check runs in its own process, so native crashes are reported rather than inherited. Call this first when another seismicx tool fails with a non-zero exit code and no error message.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          report: { type: 'string', required: true, description: 'The per-check report as printed.' },
+          healthy: { type: 'boolean', required: true, description: 'True when every required check passed.' },
+          ...RUN_FACT_PROPERTIES,
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.report.trim() !== '' ? value.report : failureText('doctor', value),
+      }],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(_args, exec) {
+      const run = await runSeismicx(ctx, paths, 'doctor', [], exec.signal)
+      // `doctor` exits 1 to mean "checks failed", which is a successful
+      // diagnosis, not a failed tool call: the report is the deliverable.
+      return { report: run.stdout.trimEnd(), healthy: run.exitCode === 0, ...runFacts(run) }
+    },
+    presentCall: () => pathCall('read', 'seismicx: environment check'),
+  }))
+}
+
+/**
  * Register `seismicx_list_models`: the bundled picker/polarity checkpoints.
  *
  * Cheap, read-only, and concurrency-safe, so it is the tool to call first when
@@ -87,7 +150,7 @@ export function applyListModelsTool(ctx: Context, paths: SkillPaths, timeoutMs: 
           ...RUN_FACT_PROPERTIES,
         },
       },
-      render: (_args, value) => [{ type: 'text', text: value.exit_code === 0 ? value.listing : `list-models failed (exit ${value.exit_code})\n${value.stderr_tail}` }],
+      render: (_args, value) => [{ type: 'text', text: value.exit_code === 0 ? value.listing : failureText('list-models', value) }],
     },
     timeoutMs,
     isConcurrencySafe: () => true,
@@ -129,7 +192,7 @@ export function applyScanTool(ctx: Context, paths: SkillPaths, timeoutMs: number
         type: 'text',
         text: value.exit_code === 0
           ? `Waveform inventory written to ${value.output_path}\n${value.stdout_tail}`
-          : `scan failed (exit ${value.exit_code})\n${value.stderr_tail}`,
+          : failureText('scan', value),
       }],
     },
     timeoutMs,
@@ -206,7 +269,7 @@ export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number
           ? `Picking started as background job ${value.job_id}; picks will land at ${value.picks_path}.`
           : value.exit_code === 0
             ? `Picks written to ${value.picks_path}\n${value.stdout_tail}`
-            : `pick failed (exit ${value.exit_code})\n${value.stderr_tail}`,
+            : failureText('pick', value),
       }],
     },
     timeoutMs,
@@ -287,7 +350,7 @@ export function applyPlotMapTool(ctx: Context, paths: SkillPaths, timeoutMs: num
       },
       render: (_args, value) => [{
         type: 'text',
-        text: value.exit_code === 0 ? `Map written to ${value.map_path}` : `plot-map failed (exit ${value.exit_code})\n${value.stderr_tail}`,
+        text: value.exit_code === 0 ? `Map written to ${value.map_path}` : failureText('plot-map', value),
       }],
       // Carried so a browser half can re-render the card from the log on replay
       // without re-reading the canonical value.
