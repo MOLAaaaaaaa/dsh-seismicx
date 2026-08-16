@@ -132,8 +132,28 @@ export async function runSeismicx(
   args: readonly string[],
   signal: AbortSignal,
 ): Promise<CliRun> {
+  return await runArgv(ctx, paths, buildArgv(paths, subcommand, args), signal)
+}
+
+/** Run a plugin-owned Python helper with the configured interpreter. */
+export async function runPythonScript(
+  ctx: Context,
+  paths: SkillPaths,
+  script: string,
+  args: readonly string[],
+  signal: AbortSignal,
+): Promise<CliRun> {
+  return await runArgv(ctx, paths, [paths.python, script, ...args], signal)
+}
+
+async function runArgv(
+  ctx: Context,
+  paths: SkillPaths,
+  argv: readonly string[],
+  signal: AbortSignal,
+): Promise<CliRun> {
   const handle = ctx.subprocess.spawn({
-    argv: buildArgv(paths, subcommand, args),
+    argv,
     cwd: paths.workdir,
     stdio: {
       stdin: 'ignore',

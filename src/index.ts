@@ -16,6 +16,7 @@ import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-tools'
 import type { SkillPaths } from './cli.ts'
 import { applyDoctorTool, applyListModelsTool, applyPickTool, applyPlotMapTool, applyScanTool } from './tools.ts'
+import { applyWorkbenchRpc } from './workbench.ts'
 
 export { buildArgv, lastLine, runSeismicx, tailLines } from './cli.ts'
 export type { CliRun, SkillPaths } from './cli.ts'
@@ -49,6 +50,12 @@ export const DEFAULT_PICK_TIMEOUT_MS = 3_600_000
 
 /** Default budget for map rendering. */
 export const DEFAULT_PLOT_TIMEOUT_MS = 600_000
+
+/** Default row count retained in browser result previews. */
+export const DEFAULT_WORKBENCH_PREVIEW_ROWS = 200
+
+/** Default maximum PNG size returned to the browser. */
+export const DEFAULT_WORKBENCH_MAP_MAX_BYTES = 20 * 1024 * 1024
 
 /** Plugin config: where the skill lives, how to run it, and which tools to publish. */
 export interface Config {
@@ -89,6 +96,10 @@ export interface Config {
   pickTimeoutMs?: number
   /** Budget (ms) for map rendering. */
   plotTimeoutMs?: number
+  /** Maximum rows retained from each workbench CSV result. */
+  workbenchPreviewRows?: number
+  /** Maximum generated map bytes returned to the browser. */
+  workbenchMapMaxBytes?: number
 }
 
 /**
@@ -116,6 +127,8 @@ export const Config: Schema<Config> = Schema.object({
   doctorTimeoutMs: Schema.number().default(DEFAULT_DOCTOR_TIMEOUT_MS),
   pickTimeoutMs: Schema.number().default(DEFAULT_PICK_TIMEOUT_MS),
   plotTimeoutMs: Schema.number().default(DEFAULT_PLOT_TIMEOUT_MS),
+  workbenchPreviewRows: Schema.number().default(DEFAULT_WORKBENCH_PREVIEW_ROWS),
+  workbenchMapMaxBytes: Schema.number().default(DEFAULT_WORKBENCH_MAP_MAX_BYTES),
 })
 
 /** Complete config after Schemastery applies every field default. */
@@ -147,17 +160,32 @@ function assertPositiveInteger(field: string, value: number): void {
  */
 export function apply(ctx: Context, config: Config): void {
   const resolved = config as ResolvedConfig
+  assertPositiveInteger('quickTimeoutMs', resolved.quickTimeoutMs)
+  assertPositiveInteger('doctorTimeoutMs', resolved.doctorTimeoutMs)
+  assertPositiveInteger('pickTimeoutMs', resolved.pickTimeoutMs)
+  assertPositiveInteger('plotTimeoutMs', resolved.plotTimeoutMs)
+  assertPositiveInteger('workbenchPreviewRows', resolved.workbenchPreviewRows)
+  assertPositiveInteger('workbenchMapMaxBytes', resolved.workbenchMapMaxBytes)
+
+  const workbenchOptions = {
+    previewRows: resolved.workbenchPreviewRows,
+    mapMaxBytes: resolved.workbenchMapMaxBytes,
+    quickTimeoutMs: resolved.quickTimeoutMs,
+    doctorTimeoutMs: resolved.doctorTimeoutMs,
+    plotTimeoutMs: resolved.plotTimeoutMs,
+    defaultOutputDir: resolved.workdir,
+  }
   if (!resolved.skillRoot.trim()) {
+    applyWorkbenchRpc(ctx, undefined, {
+      ...workbenchOptions,
+      configurationError: '请在 DSH 配置中设置 SeismicX skillRoot',
+    })
     ctx.logger.warn('seismicx: no skillRoot configured, registering no tools — set it on the `seismicx` row in your profile cordis.patch.yml (or export SEISMICX_SKILL_ROOT) to enable them')
     return
   }
   if (!isAbsolute(resolved.skillRoot)) {
     throw new Error(`seismicx: skillRoot must be an absolute path, received ${resolved.skillRoot}`)
   }
-  assertPositiveInteger('quickTimeoutMs', resolved.quickTimeoutMs)
-  assertPositiveInteger('doctorTimeoutMs', resolved.doctorTimeoutMs)
-  assertPositiveInteger('pickTimeoutMs', resolved.pickTimeoutMs)
-  assertPositiveInteger('plotTimeoutMs', resolved.plotTimeoutMs)
 
   const paths: SkillPaths = {
     skillRoot: resolved.skillRoot.replace(/[/\\]+$/, ''),
@@ -166,9 +194,11 @@ export function apply(ctx: Context, config: Config): void {
     env: resolved.env,
   }
 
+  const journal = applyWorkbenchRpc(ctx, paths, workbenchOptions)
+
   if (resolved.doctor) applyDoctorTool(ctx, paths, resolved.doctorTimeoutMs)
   if (resolved.listModels) applyListModelsTool(ctx, paths, resolved.quickTimeoutMs)
-  if (resolved.scan) applyScanTool(ctx, paths, resolved.quickTimeoutMs)
-  if (resolved.pick) applyPickTool(ctx, paths, resolved.pickTimeoutMs, resolved.allowBackground)
-  if (resolved.plotMap) applyPlotMapTool(ctx, paths, resolved.plotTimeoutMs)
+  if (resolved.scan) applyScanTool(ctx, paths, resolved.quickTimeoutMs, journal)
+  if (resolved.pick) applyPickTool(ctx, paths, resolved.pickTimeoutMs, resolved.allowBackground, journal)
+  if (resolved.plotMap) applyPlotMapTool(ctx, paths, resolved.plotTimeoutMs, journal)
 }

@@ -13,11 +13,15 @@
  * @module
  */
 
+import { randomUUID } from 'node:crypto'
+import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, ToolCallKind } from '@deepseek-ai/dsh-tools'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { explainFailure, lastLine, runSeismicx, tailLines, type CliRun, type SkillPaths } from './cli.ts'
+import { pickArguments, plotMapArguments, scanArguments } from './operation-args.ts'
+import type { PickRunRecord, WorkbenchJournal } from './workbench.ts'
 
 /**
  * `JobKind` is a merge-extensible union, so this package declares the producer
@@ -34,6 +38,10 @@ const ERROR_TAIL_LINES = 20
 
 /** Exit code reported when the process died from a signal rather than exiting. */
 const SIGNAL_EXIT_CODE = -1
+
+function workdirPath(paths: SkillPaths, path: string): string {
+  return isAbsolute(path) ? path : resolve(paths.workdir, path)
+}
 
 /** Shared shape of every CLI-backed canonical value. */
 interface RunFacts {
@@ -168,7 +176,7 @@ export function applyListModelsTool(ctx: Context, paths: SkillPaths, timeoutMs: 
  * The first step of the pipeline and the one that establishes whether the
  * archive is readable at all, so it stays foreground.
  */
-export function applyScanTool(ctx: Context, paths: SkillPaths, timeoutMs: number): void {
+export function applyScanTool(ctx: Context, paths: SkillPaths, timeoutMs: number, journal?: WorkbenchJournal): void {
   ctx.tools.register(defineTool({
     name: 'seismicx_scan',
     description: 'Scan a waveform directory for ObsPy-readable files and write the inventory CSV. Run this before picking to confirm the archive is readable.',
@@ -198,9 +206,22 @@ export function applyScanTool(ctx: Context, paths: SkillPaths, timeoutMs: number
     timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const argv = ['-w', args.waveform_dir, '-o', args.output_path]
-      if (args.errors_path) argv.push('--errors', args.errors_path)
+      const startedAt = Date.now()
+      const argv = scanArguments({
+        waveformDir: args.waveform_dir,
+        outputPath: args.output_path,
+        ...(args.errors_path ? { errorsPath: args.errors_path } : {}),
+      })
       const run = await runSeismicx(ctx, paths, 'scan', argv, exec.signal)
+      if (journal !== undefined && exec.agent !== undefined) {
+        await journal.recordToolScan(String(exec.agent.session.header.id), {
+          waveformDir: workdirPath(paths, args.waveform_dir),
+          outputPath: workdirPath(paths, args.output_path),
+          errorsPath: args.errors_path === undefined ? '' : workdirPath(paths, args.errors_path),
+          run,
+          startedAt,
+        })
+      }
       return {
         output_path: args.output_path,
         errors_path: args.errors_path ?? '',
@@ -224,7 +245,13 @@ export function applyScanTool(ctx: Context, paths: SkillPaths, timeoutMs: number
  * PNSN picker — is carried in the description rather than as a filter argument,
  * because the tool deliberately exposes no filtering knob.
  */
-export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number, allowBackground: boolean): void {
+export function applyPickTool(
+  ctx: Context,
+  paths: SkillPaths,
+  timeoutMs: number,
+  allowBackground: boolean,
+  journal?: WorkbenchJournal,
+): void {
   ctx.tools.register(defineTool({
     name: 'seismicx_pick',
     description: 'Detect and pick seismic phases over a waveform archive with the bundled PNSN picker. Continuous waveforms are picked unfiltered by design; do not pre-filter the archive. Long runs should set run_in_background.',
@@ -274,9 +301,17 @@ export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number
     },
     timeoutMs,
     async execute(args, exec) {
-      const argv = ['-w', args.waveform_dir, '-o', args.output_path, '--picker', 'torchscript-pnsn']
-      if (args.model) argv.push('--model', args.model)
-      if (args.phases) argv.push('--phases', args.phases)
+      const argv = pickArguments({
+        waveformDir: args.waveform_dir,
+        outputPath: args.output_path,
+        ...(args.model ? { model: args.model } : {}),
+        ...(args.phases ? { phases: args.phases } : {}),
+      })
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.header.id)
+      const selectedModel = args.model ?? 'pnsn-v3'
+      const selectedPhases = args.phases?.split(',').map(phase => phase.trim()).filter(Boolean) ?? []
+      const journalWaveformDir = workdirPath(paths, args.waveform_dir)
+      const journalOutputPath = workdirPath(paths, args.output_path)
 
       if (args.run_in_background) {
         if (!allowBackground) throw new Error('seismicx_pick: background execution is disabled by this deployment\'s plugin config')
@@ -287,6 +322,8 @@ export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number
         const owner = exec.agent
         if (!owner) throw new Error('seismicx_pick: run_in_background requires a calling agent to own the job')
         const controller = new AbortController()
+        const startedAt = Date.now()
+        let journalRecord: PickRunRecord | undefined
         const jobId = ctx.jobs.start({
           kind: 'seismicx-pick',
           label: `seismicx pick ${args.waveform_dir}`,
@@ -299,23 +336,83 @@ export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number
             return {
               cancel: () => controller.abort(),
               done: running.then(
-                (run): JobOutcome => run.exitCode === 0
-                  ? { status: 'completed', output: `Picks written to ${args.output_path}` }
-                  : {
-                      status: run.signal ? 'killed' : 'failed',
-                      detail: `exit code: ${run.exitCode ?? SIGNAL_EXIT_CODE}`,
-                      output: tailLines(run.stderr, ERROR_TAIL_LINES),
-                    },
-                (error: unknown): JobOutcome => ({ status: 'failed', detail: String(error) }),
+                async (run): Promise<JobOutcome> => {
+                  if (journal !== undefined && journalRecord !== undefined && sessionId !== undefined) {
+                    await journal.finishToolPick(sessionId, journalRecord, {
+                      waveformDir: journalWaveformDir,
+                      outputPath: journalOutputPath,
+                      model: selectedModel,
+                      phases: selectedPhases,
+                      run,
+                    })
+                  }
+                  return run.exitCode === 0
+                    ? { status: 'completed', output: `Picks written to ${args.output_path}` }
+                    : {
+                        status: run.signal ? 'killed' : 'failed',
+                        detail: `exit code: ${run.exitCode ?? SIGNAL_EXIT_CODE}`,
+                        output: tailLines(run.stderr, ERROR_TAIL_LINES),
+                      }
+                },
+                async (error: unknown): Promise<JobOutcome> => {
+                  if (journal !== undefined && journalRecord !== undefined && sessionId !== undefined) {
+                    journal.failToolPick(sessionId, journalRecord, error)
+                  }
+                  return { status: 'failed', detail: String(error) }
+                },
               ),
             }
           },
         })
+        if (journal !== undefined && sessionId !== undefined) {
+          journalRecord = journal.beginToolPick(sessionId, {
+            id: jobId,
+            waveformDir: journalWaveformDir,
+            outputPath: journalOutputPath,
+            model: selectedModel,
+            phases: selectedPhases,
+            controller,
+            startedAt,
+          })
+        }
         return { kind: 'background' as const, job_id: jobId, picks_path: args.output_path }
       }
 
-      const run = await runSeismicx(ctx, paths, 'pick', argv, exec.signal)
-      return { kind: 'completed' as const, picks_path: args.output_path, stdout_tail: tailLines(run.stdout, 10), ...runFacts(run) }
+      const controller = new AbortController()
+      const forwardAbort = (): void => { controller.abort(exec.signal.reason) }
+      if (exec.signal.aborted) forwardAbort(); else exec.signal.addEventListener('abort', forwardAbort, { once: true })
+      const startedAt = Date.now()
+      const journalRecord = journal !== undefined && sessionId !== undefined
+        ? journal.beginToolPick(sessionId, {
+            id: `tool-${randomUUID()}`,
+            waveformDir: journalWaveformDir,
+            outputPath: journalOutputPath,
+            model: selectedModel,
+            phases: selectedPhases,
+            controller,
+            startedAt,
+          })
+        : undefined
+      try {
+        const run = await runSeismicx(ctx, paths, 'pick', argv, controller.signal)
+        if (journal !== undefined && journalRecord !== undefined && sessionId !== undefined) {
+          await journal.finishToolPick(sessionId, journalRecord, {
+            waveformDir: journalWaveformDir,
+            outputPath: journalOutputPath,
+            model: selectedModel,
+            phases: selectedPhases,
+            run,
+          })
+        }
+        return { kind: 'completed' as const, picks_path: args.output_path, stdout_tail: tailLines(run.stdout, 10), ...runFacts(run) }
+      } catch (error) {
+        if (journal !== undefined && journalRecord !== undefined && sessionId !== undefined) {
+          journal.failToolPick(sessionId, journalRecord, error)
+        }
+        throw error
+      } finally {
+        exec.signal.removeEventListener('abort', forwardAbort)
+      }
     },
     presentCall: args => pathCall('execute', `seismicx pick: ${args.waveform_dir}`),
   }))
@@ -329,7 +426,7 @@ export function applyPickTool(ctx: Context, paths: SkillPaths, timeoutMs: number
  * first: a `tool.call.toolview` entry keyed `seismicx_plot_map` can render the
  * image inline instead of leaving a path for the user to open.
  */
-export function applyPlotMapTool(ctx: Context, paths: SkillPaths, timeoutMs: number): void {
+export function applyPlotMapTool(ctx: Context, paths: SkillPaths, timeoutMs: number, journal?: WorkbenchJournal): void {
   ctx.tools.register(defineTool({
     name: 'seismicx_plot_map',
     description: 'Plot located events and stations on a map and write a PNG.',
@@ -359,13 +456,27 @@ export function applyPlotMapTool(ctx: Context, paths: SkillPaths, timeoutMs: num
     timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const argv = ['-e', args.events_path, '-o', args.output_path]
-      if (args.stations_path) argv.push('-s', args.stations_path)
-      if (args.title) argv.push('--title', args.title)
+      const startedAt = Date.now()
+      const argv = plotMapArguments({
+        eventsPath: args.events_path,
+        outputPath: args.output_path,
+        ...(args.stations_path ? { stationsPath: args.stations_path } : {}),
+        ...(args.title ? { title: args.title } : {}),
+      })
       const run = await runSeismicx(ctx, paths, 'plot-map', argv, exec.signal)
       // The CLI prints the path it wrote; fall back to the requested path when
       // the run failed and printed nothing.
-      return { map_path: lastLine(run.stdout) || args.output_path, ...runFacts(run) }
+      const outputPath = workdirPath(paths, lastLine(run.stdout) || args.output_path)
+      if (journal !== undefined && exec.agent !== undefined) {
+        await journal.recordToolMap(String(exec.agent.session.header.id), {
+          eventsPath: workdirPath(paths, args.events_path),
+          stationsPath: args.stations_path === undefined ? '' : workdirPath(paths, args.stations_path),
+          outputPath,
+          run,
+          startedAt,
+        })
+      }
+      return { map_path: outputPath, ...runFacts(run) }
     },
     presentCall: args => pathCall('execute', `seismicx map: ${args.events_path}`),
   }))
