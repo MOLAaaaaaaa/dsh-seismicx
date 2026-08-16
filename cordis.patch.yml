@@ -5,13 +5,24 @@
 # services, so row order here carries no load semantics.
 #
 # `skillRoot` has no default and no sensible one exists: it is the absolute path
-# to the user's seismicx-catalog-skill checkout. Set it in the profile's own
-# cordis.patch.yml, or export SEISMICX_SKILL_ROOT and keep the expression below.
+# to your seismicx-catalog-skill checkout. Leaving it unset is supported — the
+# plugin logs one line and registers no tools, so installing this bundle can
+# never stop the harness from booting. Set it either by exporting
+# SEISMICX_SKILL_ROOT, or by overriding this row in your profile's own
+# cordis.patch.yml:
+#
+#   - id: seismicx
+#     config:
+#       skillRoot: /absolute/path/to/seismicx-catalog-skill
+#       python: /path/to/env/bin/python
+#
+# A patch replaces the row's whole `config`, so restate every key you need —
+# omitted keys fall back to the schema defaults, not to the values below.
 
 - insert:
     - id: seismicx
       name: dsh-seismicx
       config:
-        skillRoot: !!js process.env.SEISMICX_SKILL_ROOT
+        skillRoot: !!js process.env.SEISMICX_SKILL_ROOT ?? ''
         python: !!js process.env.SEISMICX_PYTHON ?? 'python3'
         workdir: '.'

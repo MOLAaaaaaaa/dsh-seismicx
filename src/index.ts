@@ -43,8 +43,13 @@ export const DEFAULT_PLOT_TIMEOUT_MS = 600_000
 
 /** Plugin config: where the skill lives, how to run it, and which tools to publish. */
 export interface Config {
-  /** Absolute path to the seismicx-catalog-skill checkout. */
-  skillRoot: string
+  /**
+   * Absolute path to the seismicx-catalog-skill checkout. Omitting it leaves
+   * the plugin inert rather than failing the boot: an installed-but-not-yet-
+   * pointed-at plugin is unconfigured, not misconfigured, and must not stop the
+   * harness from starting.
+   */
+  skillRoot?: string
   /** Python interpreter invoked for every subcommand. */
   python?: string
   /** Working directory the CLI resolves relative output paths against. */
@@ -68,7 +73,7 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  skillRoot: Schema.string().required(),
+  skillRoot: Schema.string().default(''),
   python: Schema.string().default('python3'),
   workdir: Schema.string().default('.'),
   listModels: Schema.boolean().default(true),
@@ -94,19 +99,26 @@ function assertPositiveInteger(field: string, value: number): void {
 /**
  * Register the enabled tools.
  *
- * `skillRoot` is checked for absoluteness here rather than at first use: the
- * failure is self-contained, so it belongs at load where it names the offending
- * `cordis.yml` row, not inside a tool call the model has to interpret. Existence
- * is deliberately NOT checked — the path may live in a sandbox or remote
- * execution world this process cannot stat, and the subprocess seam is what
- * resolves it.
+ * Unconfigured and misconfigured are treated differently. An absent `skillRoot`
+ * means the plugin is installed but not yet pointed at a checkout: it logs one
+ * line naming what to set and registers nothing, so a fresh install cannot stop
+ * the harness from booting. A `skillRoot` that IS set but relative is genuine
+ * misconfiguration and fails loud at load, where the error names the offending
+ * row instead of surfacing inside a tool call the model has to interpret.
+ *
+ * Existence is deliberately NOT checked — the path may live in a sandbox or
+ * remote execution world this process cannot stat, and the subprocess seam is
+ * what resolves it.
  *
  * @param ctx - context providing `tools`, `subprocess`, and `jobs`.
  * @param config - validated plugin config.
  */
 export function apply(ctx: Context, config: Config): void {
   const resolved = config as ResolvedConfig
-  if (!resolved.skillRoot.trim()) throw new Error('seismicx: skillRoot must not be empty')
+  if (!resolved.skillRoot.trim()) {
+    ctx.logger.warn('seismicx: no skillRoot configured, registering no tools — set it on the `seismicx` row in your profile cordis.patch.yml (or export SEISMICX_SKILL_ROOT) to enable them')
+    return
+  }
   if (!isAbsolute(resolved.skillRoot)) {
     throw new Error(`seismicx: skillRoot must be an absolute path, received ${resolved.skillRoot}`)
   }
