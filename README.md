@@ -80,7 +80,7 @@ then ask the agent to call `seismicx_list_models`.
 
 | Field | Default | Description |
 |---|---|---|
-| `skillRoot` | — (required) | Absolute path to the skill checkout |
+| `skillRoot` | — (unset ⇒ inert) | Absolute path to the skill checkout |
 | `python` | `python3` | Interpreter used for every subcommand |
 | `workdir` | `.` | Directory relative output paths resolve against |
 | `listModels` / `scan` / `pick` / `plotMap` | `true` | Register the corresponding tool |
@@ -89,9 +89,20 @@ then ask the agent to call `seismicx_list_models`.
 | `pickTimeoutMs` | `3600000` | Budget for a **foreground** pick |
 | `plotTimeoutMs` | `600000` | Budget for map rendering |
 
-`skillRoot` must be absolute; a relative or empty value fails at load, naming the offending row.
+Unconfigured and misconfigured behave differently, on purpose:
+
+- **`skillRoot` unset** — the plugin logs one line and registers no tools. Installing this bundle
+  can never stop the harness from booting; an installed-but-not-yet-pointed-at plugin is
+  unconfigured, not broken.
+- **`skillRoot` set but relative** — fails loud at load, naming the offending row. That is genuine
+  misconfiguration, and the error belongs where it identifies the row rather than inside a tool
+  call the model has to interpret.
+
 Existence is deliberately not checked — the path may live in a sandbox or remote execution world
 this process cannot stat, and `ctx.subprocess` is what resolves it.
+
+The profile's `cordis.patch.yml` is watched, so correcting `skillRoot` or `python` takes effect
+without restarting `dsh web`.
 
 ## Tools
 
